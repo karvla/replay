@@ -8,10 +8,15 @@ import pandas as pd
 import json
 import subprocess
 import numpy as np
+from pathlib import Path
+import cv2
+from tqdm import tqdm
+from collections.abc import Callable
 
 
-def _super_path(dir_entry):
-    return dir_entry.path[: -len(dir_entry.name)]
+PHOTO_FORMATS = set([".png", ".jpg", ".jpeg"])
+VIDEO_FORMATS = set([".mov", ".mp4", ".mkv", ".gif"])
+MEDIA_FORMATS = PHOTO_FORMATS.union(VIDEO_FORMATS)
 
 
 def scan_recursive(path):
@@ -23,18 +28,24 @@ def scan_recursive(path):
 
 
 def is_media(path):
-    return re.findall(r"\.(png|jpg|mp4|mkv|mov|gif)$", path.lower()) != []
+    return path.suffix.lower() in MEDIA_FORMATS
+
 
 def is_video(path):
-    return re.findall(r"\.(mp4|mkv|mov)$", path.lower()) != []
+    return path.suffix.lower() in VIDEO_FORMATS
+
 
 def is_media_json(path):
-    return re.findall(r"\.(png|jpg|mp4|mkv|mov|gif|mts).json$", path.lower()) != []
+    if len(path.suffixes) == 2:
+        suf1, suf2 = path.suffixes
+        return suf2.lower() == ".json" and suf1.lower() in MEDIA_FORMATS
+    else:
+        return False
 
 
 def duration(filename):
     if not is_video(filename):
-        return 0
+        return 0.0
 
     result = subprocess.run(
         [
@@ -62,49 +73,92 @@ def media_data(json_entry):
         metadata = json.load(f)
 
     timestamp = int(metadata["photoTakenTime"]["timestamp"])
-    path = _super_path(json_entry) + metadata["title"]
-    path = re.sub(" ", "\\ ", path)
-    path = re.sub("#", "\\#", path)
-    path = re.sub("'", "\\'", path)
-    path = re.sub("(\&|')", "_", path)
-
+    path = Path(json_entry.path)
+    path = path.parent / path.stem
     return path, timestamp, duration(path)
 
 
 def index_media(path):
-    """ 
+    """
     Takes a path to a Google Photos archive and returns a data_frame with
     all media locations and their timestamps.
     """
     media = []
     for entry in scan_recursive(path):
-        if is_media_json(entry.path):
-            location, timestamp, duration = media_data(entry)
+        if is_media_json(Path(entry.path)):
+            try:
+                location, timestamp, duration = media_data(entry)
+            except Exception as e:
+                print(e)
+                continue
             media.append(
-                {"timestamp": timestamp, "duration": duration, "location": location}
+                {
+                    "timestamp": timestamp,
+                    "duration": duration,
+                    "location": location,
+                    "video": is_video(location),
+                }
             )
 
     df = pd.DataFrame(media)
-    df.sort_values("timestamp")
+    return df.sort_values("timestamp")
+
+
+def set_target_durations(
+    df: pd.DataFrame, target_length: int, rule: Callable = np.sqrt
+):
+    t = df["timestamp"].values
+    target_durations = np.append((t[1:] - t[:-1]), [100])
+    target_durations = rule(target_durations)
+    target_durations = target_length / sum(target_durations) * target_durations
+    df["target_length"] = target_durations
     return df
 
-def set_target_durations(df, total_target_duration):
-    t = df["timestamp"]
-    target_durations = np.array(([t2-t1 for t1, t2 in zip(t[:-1], t[1:])] + [100]))
-    scale_factor = np.divide(target_durations.sum(), total_target_duration)
-    target_durations = np.divide(target_durations, scale_factor)
 
-    df["target_durations"] = target_durations
-    return df
+# https://github.com/qqwweee/keras-yolo3/issues/330#issuecomment-472462125
+def letterbox_image(image, expected_size):
+    ih, iw, _ = image.shape
+    ew, eh = expected_size
+    scale = min(eh / ih, ew / iw)
+    nh = int(ih * scale)
+    nw = int(iw * scale)
+
+    image = cv2.resize(image, (nw, nh), interpolation=cv2.INTER_CUBIC)
+    new_img = np.full((eh, ew, 3), 0, dtype="uint8")
+    new_img[
+        (eh - nh) // 2 : (eh - nh) // 2 + nh, (ew - nw) // 2 : (ew - nw) // 2 + nw, :
+    ] = image.copy()
+    return new_img
 
 
-def render_video(location, title, duration):
-    command = """
-    ffmpeg -i {} -r {} -an -vf "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2"  {}.mp4
-    """.format(
-        location, duration, title
-    )
-    os.system(command)
+def frame_gen(video_path):
+    vidcap = cv2.VideoCapture(str(video_path))
+    sucess, image = vidcap.read()
+    while sucess:
+        yield image
+        sucess, image = vidcap.read()
+
+
+def make_video(frames: pd.DataFrame, size=(1920, 1080), fps=60):
+    fourcc = cv2.VideoWriter_fourcc(*"XVID")
+    out = cv2.VideoWriter("output.avi", fourcc, 20.0, size)
+    for n, row in tqdm(frames.iterrows(), total=len(frames)):
+        target_length = row["target_length"]
+        n_frames = max(1, int(fps * target_length))
+        if row["video"]:
+            frame_skip = int(row["duration"] * fps / (n_frames * 10))
+            for n, frame in enumerate(frame_gen(row["location"])):
+                if n % frame_skip != 0:
+                    continue
+                else:
+                    frame = letterbox_image(frame, size)
+                    out.write(frame)
+        else:
+            frame = cv2.imread(str(row["location"]))
+            frame = letterbox_image(frame, size)
+            [out.write(frame) for n in range(n_frames)]
+    out.release()
+
 
 def date_taken(path):
     try:
@@ -113,14 +167,14 @@ def date_taken(path):
         return False
 
 
+@click.command()
+@click.argument("source", type=click.Path())
+@click.argument("length", type=int)
+def main(**kwargs):
+    df = index_media(kwargs["source"])
+    df = set_target_durations(df, kwargs["length"])
+    make_video(df)
+
+
 if __name__ == "__main__":
-    import sys
-
-    path = sys.argv[1]
-    df = index_media(path)
-    df = set_target_durations(df, 10)
-    print(df["location"][0])
-    index = 5
-    render_video(df["location"][index],  "test", df["target_durations"][index])
-
-#    main()
+    main()
