@@ -12,10 +12,10 @@ from pathlib import Path
 import cv2
 from tqdm import tqdm
 from collections.abc import Callable
-
+import traceback
 
 PHOTO_FORMATS = set([".png", ".jpg", ".jpeg"])
-VIDEO_FORMATS = set([".mov", ".mp4", ".mkv", ".gif"])
+VIDEO_FORMATS = set([".mov", ".m4a", ".mp4", ".mkv", ".gif", ".m4v", ".mts", ".3gp"])
 MEDIA_FORMATS = PHOTO_FORMATS.union(VIDEO_FORMATS)
 
 
@@ -47,21 +47,13 @@ def duration(filename):
     if not is_video(filename):
         return 0.0
 
-    result = subprocess.run(
-        [
-            "ffprobe",
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            filename,
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-    )
-    return float(result.stdout)
+    vidcapture = cv2.VideoCapture(filename.as_posix())
+    fps = vidcapture.get(cv2.CAP_PROP_FPS)
+    if not fps:
+        return 0.0
+    total_frames = vidcapture.get(cv2.CAP_PROP_FRAME_COUNT)
+    duration = float(total_frames) / float(fps)
+    return duration
 
 
 def media_data(json_entry):
@@ -80,16 +72,15 @@ def media_data(json_entry):
 
 def index_media(path):
     """
-    Takes a path to a Google Photos archive and returns a data_frame with
+    Takes a path to a Google Photos archive and returns a dataframe with
     all media locations and their timestamps.
     """
     media = []
-    for entry in scan_recursive(path):
+    for entry in tqdm(scan_recursive(path), desc="Indexing media"):
         if is_media_json(Path(entry.path)):
             try:
                 location, timestamp, duration = media_data(entry)
             except Exception as e:
-                print(e)
                 continue
             media.append(
                 {
@@ -101,15 +92,15 @@ def index_media(path):
             )
 
     df = pd.DataFrame(media)
-    return df.sort_values("timestamp")
+    return df.sort_values("timestamp").reset_index()
 
 
 def set_target_durations(
-    df: pd.DataFrame, target_length: int, rule: Callable = np.sqrt
+    df: pd.DataFrame, target_length: int, scale_method: Callable = np.log
 ):
     t = df["timestamp"].values
     target_durations = np.append((t[1:] - t[:-1]), [100])
-    target_durations = rule(target_durations)
+    target_durations = scale_method(target_durations)
     target_durations = target_length / sum(target_durations) * target_durations
     df["target_length"] = target_durations
     return df
@@ -139,24 +130,59 @@ def frame_gen(video_path):
         sucess, image = vidcap.read()
 
 
-def make_video(frames: pd.DataFrame, size=(1920, 1080), fps=60):
+@click.command()
+@click.argument("source", type=click.Path())
+@click.option(
+    "--length",
+    "-l",
+    type=int,
+    default=600,
+    help="Target length in seconds for output video",
+)
+@click.option("--fps", "-r", type=int, default=60)
+@click.option("--framedrop", "-f", type=int, default=2)
+@click.option("--videoweight", "-v", type=int, default=10)
+@click.option(
+    "--scale_method", "-s", type=click.Choice(["log", "sqrt"]), default="sqrt"
+)
+@click.option(
+    "--resolution", nargs=2, type=click.Tuple([int, int]), default=(1920, 1080)
+)
+def make_video(**kwargs):
+    fps = kwargs["fps"]
+    size = kwargs["resolution"]
+
+    scale_method = kwargs["scale_method"]
+    if scale_method == "log":
+        sm = np.log
+    elif scale_method == "sqrt":
+        sm = np.sqrt
+
+    df = index_media(kwargs["source"])
+    media = set_target_durations(df, kwargs["length"], sm)
+
     fourcc = cv2.VideoWriter_fourcc(*"XVID")
-    out = cv2.VideoWriter("output.avi", fourcc, 20.0, size)
-    for n, row in tqdm(frames.iterrows(), total=len(frames)):
-        target_length = row["target_length"]
-        n_frames = max(1, int(fps * target_length))
-        if row["video"]:
-            frame_skip = int(row["duration"] * fps / (n_frames * 10))
-            for n, frame in enumerate(frame_gen(row["location"])):
-                if n % frame_skip != 0:
-                    continue
-                else:
-                    frame = letterbox_image(frame, size)
-                    out.write(frame)
-        else:
-            frame = cv2.imread(str(row["location"]))
-            frame = letterbox_image(frame, size)
-            [out.write(frame) for n in range(n_frames)]
+    out = cv2.VideoWriter("output.avi", fourcc, fps, size)
+    media = media.dropna()
+    try:
+        for n, row in tqdm(media.iterrows(), total=len(media), desc="Making video"):
+            target_length = row["target_length"]
+            n_frames = max(1, int(fps * target_length))
+            if row["video"]:
+                for n, frame in enumerate(frame_gen(row["location"])):
+                    if n % kwargs["framedrop"] == 0:
+                        continue
+                    if n > n_frames * kwargs["framedrop"] * kwargs["videoweight"]:
+                        break
+                    else:
+                        frame = letterbox_image(frame, size)
+                        out.write(frame)
+            else:
+                frame = cv2.imread(row["location"].as_posix())
+                frame = letterbox_image(frame, size)
+                [out.write(frame) for n in range(n_frames)]
+    except KeyboardInterrupt:
+        pass
     out.release()
 
 
@@ -167,14 +193,5 @@ def date_taken(path):
         return False
 
 
-@click.command()
-@click.argument("source", type=click.Path())
-@click.argument("length", type=int)
-def main(**kwargs):
-    df = index_media(kwargs["source"])
-    df = set_target_durations(df, kwargs["length"])
-    make_video(df)
-
-
 if __name__ == "__main__":
-    main()
+    make_video()
