@@ -99,10 +99,12 @@ def set_target_durations(
     df: pd.DataFrame, target_length: int, scale_method: Callable = np.log
 ):
     t = df["timestamp"].values
-    target_durations = np.append((t[1:] - t[:-1]), [100])
-    target_durations = scale_method(target_durations)
-    target_durations = target_length / sum(target_durations) * target_durations
-    df["target_length"] = target_durations
+    durations = t[1:] - t[:-1]
+    durations = np.append(durations, durations[-1])
+    durations += (durations == 0).astype(int)
+    durations = scale_method(durations)
+    durations *= target_length / sum(durations)
+    df["target_length"] = durations
     return df
 
 
