@@ -22,7 +22,7 @@ MEDIA_FORMATS = PHOTO_FORMATS.union(VIDEO_FORMATS)
 def scan_recursive(path):
     for entry in scandir(path):
         if entry.is_file():
-            yield entry
+            yield Path(entry.path)
         else:
             yield from scan_recursive(entry.path)
 
@@ -56,16 +56,16 @@ def duration(filename):
     return duration
 
 
-def media_data(json_entry):
+def media_data(json_path):
     """
     Takes a DirEntry of a .json and returns the location and timestamp of the
     corresponding file.
     """
-    with open(json_entry.path) as f:
+    with open(json_path) as f:
         metadata = json.load(f)
 
     timestamp = int(metadata["photoTakenTime"]["timestamp"])
-    path = Path(json_entry.path)
+    path = json_path
     path = path.parent / path.stem
     return path, timestamp, duration(path)
 
@@ -76,11 +76,12 @@ def index_media(path):
     all media locations and their timestamps.
     """
     media = []
-    for entry in tqdm(scan_recursive(path), desc="Indexing media"):
-        if is_media_json(Path(entry.path)):
+    for file_path in tqdm(scan_recursive(path), desc="Indexing media"):
+        if is_media_json(file_path):
             try:
-                location, timestamp, duration = media_data(entry)
+                location, timestamp, duration = media_data(file_path)
             except Exception as e:
+                print(e)
                 continue
             media.append(
                 {
@@ -133,7 +134,7 @@ def frame_gen(video_path):
 
 
 @click.command()
-@click.argument("source", type=click.Path())
+@click.argument("source", type=click.Path(exists=True))
 @click.option(
     "--length",
     "-l",
